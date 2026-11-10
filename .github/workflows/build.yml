@@ -1,0 +1,455 @@
+name: Nuva — build & release
+
+# Модель как у ZiziPlayer: код приезжает zip-архивом `nuva-<versionName>.zip` в корень репо.
+# Workflow берёт архив с наибольшим versionCode (из version.properties внутри), гоняет
+# серверные тесты и тест-векторы, собирает клиентов (когда в архиве есть client/) и
+# публикует релиз v<versionName>. GitHub читает ТОЛЬКО корневой .github/workflows —
+# копия этого файла внутри zip справочная: при изменении положи её в корень руками.
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'nuva-*.zip'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Опубликовать релиз (выкл — только артефакты)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+# Релизы не отменяем на полпути: следующий прогон ждёт в очереди.
+concurrency:
+  group: nuva-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PY_VERSION: '3.12'
+  JAVA_VERSION: '17'
+  GRADLE_VERSION: '8.11.1'
+
+jobs:
+  source:
+    name: Распаковка архива
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.unpack.outputs.version }}
+      code: ${{ steps.unpack.outputs.code }}
+      zip: ${{ steps.unpack.outputs.zip }}
+      has_client: ${{ steps.unpack.outputs.has_client }}
+      prerelease: ${{ steps.unpack.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Выбор и распаковка zip по versionCode
+        id: unpack
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, os, re, shutil, stat, zipfile
+          from pathlib import Path, PurePosixPath
+
+          candidates = []
+          for path in sorted(Path('.').glob('nuva-*.zip')):
+              try:
+                  with zipfile.ZipFile(path) as z:
+                      names = z.namelist()
+                      props = [n for n in names if PurePosixPath(n).name == 'version.properties'
+                               and len(PurePosixPath(n).parts) <= 2]
+                      if len(props) != 1:
+                          print(f'skip {path.name}: no single version.properties at root')
+                          continue
+                      parent = str(PurePosixPath(props[0]).parent)
+                      prefix = '' if parent == '.' else parent + '/'
+                      if z.getinfo(props[0]).file_size > 4096:
+                          raise ValueError('oversized version.properties')
+                      text = z.read(props[0]).decode('utf-8')
+                      codes = re.findall(r'^\s*versionCode\s*=\s*([0-9]+)\s*$', text, re.M)
+                      names_ = re.findall(r'^\s*versionName\s*=\s*([0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.]+)?)\s*$', text, re.M)
+                      if len(codes) != 1 or len(names_) != 1:
+                          raise ValueError('need exactly one versionCode and versionName (X.Y.Z[-tag])')
+                      candidates.append((int(codes[0]), path, prefix, names_[0]))
+              except (OSError, ValueError, zipfile.BadZipFile) as exc:
+                  raise SystemExit(f'Invalid source ZIP {path.name}: {exc}')
+          if not candidates:
+              raise SystemExit('No nuva-*.zip with version.properties found')
+          top = max(c[0] for c in candidates)
+          winners = [c for c in candidates if c[0] == top]
+          if len(winners) != 1:
+              raise SystemExit('Several ZIPs share the highest versionCode: ' + ', '.join(c[1].name for c in winners))
+          code, path, prefix, version = winners[0]
+          if path.name != f'nuva-{version}.zip':
+              print(f'::warning::{path.name} does not match versionName {version} (expected nuva-{version}.zip)')
+
+          with zipfile.ZipFile(path) as z:
+              entries = z.infolist()
+              if len(entries) > 20000 or sum(e.file_size for e in entries) > 300 * 1024 * 1024:
+                  raise SystemExit('Archive exceeds extraction limits')
+              if len(set(z.namelist())) != len(entries):
+                  raise SystemExit('Duplicate archive entries')
+              for e in entries:
+                  n = PurePosixPath(e.filename)
+                  if (n.is_absolute() or '..' in n.parts or '\\' in e.filename
+                          or any(c in e.filename for c in '\r\n') or stat.S_ISLNK(e.external_attr >> 16)):
+                      raise SystemExit(f'Unsafe archive entry: {e.filename!r}')
+              shutil.rmtree('_src', ignore_errors=True)
+              z.extractall('_src')
+          root = Path('_src') / prefix.rstrip('/') if prefix else Path('_src')
+          if root != Path('_src'):
+              tmp = Path('_src_root'); shutil.move(str(root), tmp); shutil.rmtree('_src'); tmp.rename('_src')
+          has_client = (Path('_src') / 'client' / 'settings.gradle.kts').is_file()
+          if not (Path('_src') / 'server' / 'pyproject.toml').is_file():
+              raise SystemExit('server/pyproject.toml missing in archive')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'version={version}\ncode={code}\nzip={path.name}\n'
+                        f'has_client={"true" if has_client else "false"}\n'
+                        f'prerelease={"true" if "-" in version else "false"}\n')
+          print(f'Selected {path.name}: version {version}, versionCode {code}, client={has_client}')
+          print('SHA256', hashlib.sha256(path.read_bytes()).hexdigest())
+          PY
+
+      - name: Секреты в архиве
+        run: |
+          set -euo pipefail
+          bad=0
+          if find _src -type f \( -name '.env' -o -name '*.jks' -o -name '*.keystore' -o -name '*.p12' -o -name 'local.properties' \) | grep -q .; then
+            find _src -type f \( -name '.env' -o -name '*.jks' -o -name '*.keystore' -o -name '*.p12' -o -name 'local.properties' \)
+            echo "::error::В архиве файлы с секретами/локальными путями"; bad=1
+          fi
+          if grep -rIlE -- '-----BEGIN [A-Z ]*PRIVATE KEY-----|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{36}' _src; then
+            echo "::error::Похоже на приватный ключ/токен в исходниках"; bad=1
+          fi
+          exit $bad
+
+      - name: Упаковать исходники для следующих job
+        run: tar -czf source.tgz _src
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source
+          path: source.tgz
+          retention-days: 3
+          if-no-files-found: error
+
+  server:
+    name: Сервер — векторы и тесты
+    needs: source
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: nuva
+          POSTGRES_PASSWORD: nuva
+          POSTGRES_DB: nuva_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U nuva -d nuva_test"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      VERSION: ${{ needs.source.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: source }
+      - run: tar -xzf source.tgz
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PY_VERSION }}
+          cache: pip
+          cache-dependency-path: _src/server/pyproject.toml
+
+      - name: Зависимости
+        working-directory: _src/server
+        run: python -m pip install --quiet -e ".[test]"
+
+      - name: Синтаксис
+        working-directory: _src/server
+        run: python -m compileall -q app tools tests
+
+      - name: Тест-векторы v1 (эталон == закоммиченный файл, HKDF RFC 5869)
+        working-directory: _src/server
+        run: python tools/vectors.py --check
+
+      - name: pytest (PostgreSQL)
+        working-directory: _src/server
+        env:
+          DATABASE_URL: postgresql://nuva:nuva@localhost:5432/nuva_test
+        run: |
+          set -o pipefail
+          python -m pytest -q 2>&1 | tee "$GITHUB_WORKSPACE/server-tests.log"
+
+      - name: Образ собирается
+        run: docker build --quiet -t nuva-api:ci _src/server
+
+      - name: Пакет сервера
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          tar -czf "dist/nuva-server-${VERSION}.tar.gz" \
+            --exclude='__pycache__' --exclude='.pytest_cache' --exclude='*.egg-info' \
+            -C _src server
+          cp _src/server/tools/test-vectors.json "dist/nuva-test-vectors-${VERSION}.json"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-server
+          path: dist/*
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: server-tests-log
+          path: server-tests.log
+          if-no-files-found: ignore
+
+  android:
+    name: Android APK
+    needs: source
+    if: needs.source.outputs.has_client == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      VERSION: ${{ needs.source.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: source }
+      - run: tar -xzf source.tgz
+
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '${{ env.JAVA_VERSION }}' }
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+          cache-read-only: false
+
+      # Обновление поверх старого APK возможно ТОЛЬКО с тем же ключом и бо́льшим versionCode.
+      # Ключ Nuva — свой, не Zizi. Потеря ключа = все пользователи переустанавливают.
+      - name: Ключ подписи
+        id: keystore
+        env:
+          RAW_KEYSTORE_B64: ${{ secrets.NUVA_SIGNING_KEYSTORE_BASE64 }}
+          RAW_STORE_PW: ${{ secrets.NUVA_SIGNING_STORE_PASSWORD }}
+          RAW_KEY_ALIAS: ${{ secrets.NUVA_SIGNING_KEY_ALIAS }}
+          RAW_KEY_PW: ${{ secrets.NUVA_SIGNING_KEY_PASSWORD }}
+        # Секреты часто вставляют с телефона: прилетают пробелы, переносы, NBSP, zero-width, BOM,
+        # а клавиатура подменяет латиницу кириллицей. Невидимое чистим, остальное диагностируем
+        # ДО Gradle — с понятной ошибкой вместо стектрейса из packageRelease. Значения не печатаются.
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, os, sys, unicodedata
+
+          INVISIBLE = {'\u200b', '\u200c', '\u200d', '\u200e', '\u200f', '\u2060', '\ufeff', '\u00ad'}
+          errors = []
+
+          def clean(name, raw, inner_ws):
+              v = ''.join(ch for ch in raw if ch not in INVISIBLE)
+              v = ''.join(ch for ch in v if not ch.isspace()) if inner_ws else v.strip()
+              if raw != v:
+                  print(f'{name}: убраны невидимые/пробельные символы ({len(raw)} -> {len(v)})')
+              return v
+
+          def check_ascii(name, v):
+              if 'NUVA_' in v or v.startswith(('1)', '2)', '3)', '4)')):
+                  errors.append(f'{name}: похоже, вставлена строка-заголовок из инструкции, а не значение')
+              bad = [(i + 1, unicodedata.name(ch, hex(ord(ch)))) for i, ch in enumerate(v) if ord(ch) > 126 or ord(ch) < 32]
+              if bad:
+                  where = ', '.join(f'символ {i}: {n}' for i, n in bad[:5])
+                  errors.append(f'{name}: не-ASCII ({where}). Обычно это автозамена клавиатуры или кириллица '
+                                f'вместо латиницы. Скопируй значение заново с ПК или через «Копировать» без клавиатуры.')
+
+          b64 = clean('NUVA_SIGNING_KEYSTORE_BASE64', os.environ.get('RAW_KEYSTORE_B64', ''), inner_ws=True)
+          store_pw = clean('NUVA_SIGNING_STORE_PASSWORD', os.environ.get('RAW_STORE_PW', ''), inner_ws=False)
+          alias = clean('NUVA_SIGNING_KEY_ALIAS', os.environ.get('RAW_KEY_ALIAS', ''), inner_ws=False) or 'nuva'
+          key_pw = clean('NUVA_SIGNING_KEY_PASSWORD', os.environ.get('RAW_KEY_PW', ''), inner_ws=False)
+          if not key_pw:
+              print('NUVA_SIGNING_KEY_PASSWORD пуст: беру пароль хранилища (для PKCS12 они совпадают)')
+              key_pw = store_pw
+
+          if not b64:
+              errors.append('NUVA_SIGNING_KEYSTORE_BASE64 не задан: debug-подписанный APK потом не обновится релизным')
+          if not store_pw:
+              errors.append('NUVA_SIGNING_STORE_PASSWORD не задан')
+          check_ascii('NUVA_SIGNING_STORE_PASSWORD', store_pw)
+          check_ascii('NUVA_SIGNING_KEY_PASSWORD', key_pw)
+          check_ascii('NUVA_SIGNING_KEY_ALIAS', alias)
+
+          jks = os.path.join(os.environ['RUNNER_TEMP'], 'nuva.jks')
+          if b64:
+              try:
+                  data = base64.b64decode(b64 + '=' * (-len(b64) % 4), validate=True)
+              except Exception:
+                  errors.append('NUVA_SIGNING_KEYSTORE_BASE64 не декодируется: вставлен не целиком или с лишними символами')
+              else:
+                  if len(data) < 1000:
+                      errors.append(f'NUVA_SIGNING_KEYSTORE_BASE64 слишком короткий ({len(data)} байт): обрезан при копировании')
+                  with open(jks, 'wb') as f:
+                      f.write(data)
+
+          if errors:
+              for e in errors:
+                  print(f'::error::{e}')
+              sys.exit(1)
+
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              for k, v in (('NUVA_SIGNING_STORE_PASSWORD', store_pw), ('NUVA_SIGNING_KEY_PASSWORD', key_pw)):
+                  print(f'::add-mask::{v}')
+                  env.write(f'{k}={v}\n')
+              env.write(f'NUVA_SIGNING_KEY_ALIAS={alias}\n')
+              env.write(f'NUVA_SIGNING_STORE_FILE={jks}\n')
+          PY
+
+          # Ключ реально открывается этими паролями? Проверяем здесь, а не через 4 минуты в packageRelease.
+          # keytool для PKCS12 молча игнорирует -keypass, а AGP — нет, поэтому проверяем тем же путём, что AGP:
+          # KeyStore.load(storePassword) + getKey(alias, keyPassword).
+          jks="$RUNNER_TEMP/nuva.jks"
+          cat > "$RUNNER_TEMP/KeyCheck.java" <<'JAVA'
+          import java.io.FileInputStream;
+          import java.security.KeyStore;
+          import java.security.MessageDigest;
+          public class KeyCheck {
+              public static void main(String[] a) throws Exception {
+                  char[] sp = System.getenv("NUVA_SIGNING_STORE_PASSWORD").toCharArray();
+                  char[] kp = System.getenv("NUVA_SIGNING_KEY_PASSWORD").toCharArray();
+                  String alias = System.getenv("NUVA_SIGNING_KEY_ALIAS");
+                  KeyStore ks = KeyStore.getInstance("PKCS12");
+                  try (FileInputStream in = new FileInputStream(a[0])) { ks.load(in, sp); }
+                  catch (Exception e) { fail("Хранилище не открывается: неверный NUVA_SIGNING_STORE_PASSWORD либо base64 от другого файла"); }
+                  if (!ks.isKeyEntry(alias)) fail("В хранилище нет ключа '" + alias + "': проверь NUVA_SIGNING_KEY_ALIAS (должен быть nuva). Есть: " + java.util.Collections.list(ks.aliases()));
+                  try { if (ks.getKey(alias, kp) == null) throw new Exception(); }
+                  catch (Exception e) { fail("Хранилище открылось, но ключ нет: неверный NUVA_SIGNING_KEY_PASSWORD (для ключа Nuva он равен паролю хранилища)"); }
+                  byte[] d = MessageDigest.getInstance("SHA-256").digest(ks.getCertificate(alias).getEncoded());
+                  StringBuilder sb = new StringBuilder();
+                  for (int i = 0; i < d.length; i++) sb.append(i == 0 ? "" : ":").append(String.format("%02X", d[i]));
+                  System.out.println("Ключ подписи открыт. SHA-256 сертификата: " + sb);
+              }
+              static void fail(String m) { System.out.println("::error::" + m); System.exit(1); }
+          }
+          JAVA
+          java "$RUNNER_TEMP/KeyCheck.java" "$jks"
+          echo "path=$jks" >> "$GITHUB_OUTPUT"
+
+      - name: assembleRelease
+        working-directory: _src/client
+        env:
+          # NUVA_SIGNING_* (очищенные) приходят из GITHUB_ENV шага «Ключ подписи».
+          NUVA_SERVER_HOST: ${{ vars.NUVA_SERVER_HOST }}
+        run: |
+          set -o pipefail
+          gradle --no-daemon --max-workers=2 --continue :app-android:assembleRelease --stacktrace 2>&1 | tee "$GITHUB_WORKSPACE/android-build.log"
+
+      - name: Проверка подписи
+        run: |
+          set -euo pipefail
+          apk=$(find _src/client/app-android/build/outputs/apk/release -name '*.apk' | head -1)
+          signer=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | tail -1)
+          "$signer" verify --print-certs "$apk" | tee "$RUNNER_TEMP/sig.txt" | grep -E 'DN|SHA-256' || true
+          if grep -q 'CN=Android Debug' "$RUNNER_TEMP/sig.txt"; then
+            echo "::error::APK подписан debug-ключом"; exit 1
+          fi
+          mkdir -p dist && cp "$apk" "dist/Nuva-${VERSION}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-android
+          path: dist/*
+          if-no-files-found: error
+
+      # Тесты ядра НЕ блокируют APK: упавший тест не должен отнимать у нас сборку для проверки руками.
+      # Результат смотрим в логе core-tests-log (шаг помечается ошибкой, но job остаётся зелёным).
+      - name: Тесты ядра (не блокируют APK)
+        continue-on-error: true
+        working-directory: _src/client
+        env:
+          NUVA_SERVER_HOST: ${{ vars.NUVA_SERVER_HOST }}
+        run: |
+          set -o pipefail
+          gradle --no-daemon --max-workers=2 --continue :core:desktopTest --stacktrace 2>&1 | tee "$GITHUB_WORKSPACE/core-tests.log"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: android-build-log
+          path: |
+            android-build.log
+            core-tests.log
+          if-no-files-found: ignore
+
+  desktop:
+    name: Desktop ${{ matrix.os }}
+    needs: source
+    if: needs.source.outputs.has_client == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            format: msi
+          - os: ubuntu-latest
+            format: deb
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      VERSION: ${{ needs.source.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: source }
+      - run: tar -xzf source.tgz
+
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '${{ env.JAVA_VERSION }}' }
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+          cache-read-only: false
+
+      - name: package${{ matrix.format }}
+        working-directory: _src/client
+        env:
+          NUVA_SERVER_HOST: ${{ vars.NUVA_SERVER_HOST }}
+        run: gradle --no-daemon --max-workers=2 :app-desktop:packageDistributionForCurrentOS --stacktrace
+
+      - name: Переименовать
+        run: |
+          set -euo pipefail
+          f=$(find _src/client/app-desktop/build/compose/binaries -name "*.${{ matrix.format }}" | head -1)
+          [ -n "$f" ] || { echo "::error::нет .${{ matrix.format }}"; exit 1; }
+          mkdir -p dist && cp "$f" "dist/Nuva-${VERSION}.${{ matrix.format }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-desktop-${{ matrix.format }}
+          path: dist/*
+          if-no-files-found: error
+
+      # jpackage/WiX пишут причину падения в свои файлы, а не в лог Gradle — забираем их.
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: desktop-${{ matrix.format }}-jpackage-logs
+          path: _src/client/app-desktop/build/compose/logs/**
+          if-no-files-found: ignore
+
+  release:
+    name: Релиз v${{ needs.source.outputs.version }}
+    needs: [source, server, android, desktop]
+    # android/desktop = skipped, пока в архиве нет client/. Падение любого = релиза нет.
+    if: >-
+      always() &&
+      needs.source.result == 'success' &&
+      needs.server.result == 'success' &&
+      (needs.android.result == 'success' || needs.android.result == 'skipped') &&
+      (needs.desktop.result == 'success' || needs.desktop.result == 'skipp
