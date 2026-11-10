@@ -452,4 +452,67 @@ jobs:
       needs.source.result == 'success' &&
       needs.server.result == 'success' &&
       (needs.android.result == 'success' || needs.android.result == 'skipped') &&
-      (needs.desktop.result == 'success' || needs.desktop.result == 'skipp
+      (needs.desktop.result == 'success' || needs.desktop.result == 'skipped') &&
+      (github.event_name == 'push' || inputs.publish)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      VERSION: ${{ needs.source.outputs.version }}
+      CODE: ${{ needs.source.outputs.code }}
+      TAG: v${{ needs.source.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with: { name: source }
+      - run: tar -xzf source.tgz
+
+      # versionCode только растёт: иначе Android откажется ставить APK поверх.
+      - name: Монотонность версии
+        run: |
+          set -euo pipefail
+          prev_tag=$(gh release list --exclude-drafts --limit 1 --json tagName -q '.[0].tagName' 2>/dev/null || true)
+          if [ -n "$prev_tag" ] && gh release download "$prev_tag" --pattern version.json --output prev.json 2>/dev/null; then
+            prev_code=$(jq -r .versionCode prev.json); prev_name=$(jq -r .versionName prev.json)
+            echo "Предыдущий релиз: $prev_tag ($prev_name, code $prev_code)"
+            if [ "$CODE" -lt "$prev_code" ]; then
+              echo "::error::versionCode $CODE < $prev_code ($prev_tag). Подними versionCode в version.properties."; exit 1
+            fi
+            if [ "$CODE" -eq "$prev_code" ] && [ "$VERSION" != "$prev_name" ]; then
+              echo "::error::versionCode $CODE уже занят версией $prev_name"; exit 1
+            fi
+            if [ "$CODE" -eq "$prev_code" ]; then
+              echo "::warning::Та же версия $VERSION: ассеты релиза $TAG будут перезалиты"
+            fi
+          else
+            echo "Предыдущих релизов с version.json нет"
+          fi
+
+      - name: version.json и заметки
+        run: |
+          set -euo pipefail
+          jq -n --arg n "$VERSION" --argjson c "$CODE" --arg sha "$GITHUB_SHA" \
+            '{versionName:$n, versionCode:$c, commit:$sha, protocol:"nuva.v1", envelope:1}' > dist/version.json
+          if [ -f _src/RELEASE_NOTES.md ]; then cp _src/RELEASE_NOTES.md notes.md
+          else printf 'Nuva %s (versionCode %s)\n' "$VERSION" "$CODE" > notes.md; fi
+          (cd dist && sha256sum * > SHA256SUMS.txt)
+          ls -lh dist
+
+      - name: Публикация
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: Nuva ${{ env.VERSION }}
+          target_commitish: ${{ github.sha }}
+          body_path: notes.md
+          prerelease: ${{ needs.source.outputs.prerelease == 'true' }}
+          make_latest: ${{ needs.source.outputs.prerelease == 'true' && 'false' || 'true' }}
+          files: dist/*
+          fail_on_unmatched_files: true
+          overwrite_files: true
