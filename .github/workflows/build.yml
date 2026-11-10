@@ -335,7 +335,11 @@ jobs:
               static void fail(String m) { System.out.println("::error::" + m); System.exit(1); }
           }
           JAVA
-          java "$RUNNER_TEMP/KeyCheck.java" "$jks"
+          for k in NUVA_SIGNING_STORE_PASSWORD NUVA_SIGNING_KEY_PASSWORD NUVA_SIGNING_KEY_ALIAS; do
+            v=$(grep "^${k}=" "$GITHUB_ENV" | tail -n 1 | cut -d= -f2-)
+            export "$k=$v"
+          done
+          java -Dfile.encoding=UTF-8 -Dsun.stdout.encoding=UTF-8 -Dstdout.encoding=UTF-8 "$RUNNER_TEMP/KeyCheck.java" "$jks"
           echo "path=$jks" >> "$GITHUB_OUTPUT"
 
       - name: assembleRelease
